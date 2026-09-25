@@ -1,0 +1,22 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          shellcheck -S warning build.sh build-on-linux.sh tools/embed-recipe.sh \
+            recipe/iso_add/autorun/autorun recipe/iso_add/root-tools/*.sh
+
+      - name: embedded recipe is up to date
+        run: bash tools/embed-recipe.sh --check

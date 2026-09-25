@@ -1,0 +1,321 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# rescue-cloudinit  --  cloud-init-style bootstrap for SystemRescue
+#
+# SystemRescue ships no cloud-init. This autorun script provides the same
+# result for a rescue system: right after boot the box is reachable over SSH
+# with the configured key(s), and it has its IP.
+#
+# Primary target: a self-hosted Proxmox VE. Proxmox builds a NoCloud config
+# drive (volume label "cidata", attached as an IDE CD-ROM) from the VM's
+# Cloud-Init tab. This script reads that drive and applies it:
+#   - SSH keys  from user-data / meta-data   -> /root/.ssh/authorized_keys
+#   - IP config from network-config (netplan)-> nmcli
+# It ALSO works on public clouds via the EC2-style metadata service, so the
+# same ISO is usable everywhere.
+#
+#   1. bring up networking (SystemRescue DHCPs automatically; we wait/nudge)
+#   2. pull SSH key(s) from a config-drive and/or the metadata service
+#   3. pull IP config (static or dhcp) and apply it via NetworkManager
+#   4. make sure sshd is running and accepts key-based root login
+#   5. print a summary (assigned IPs + installed key fingerprints)
+#
+# Metadata sources: NoCloud/OpenStack config-drive (Proxmox, etc.), plus
+# EC2/IMDSv2, Hetzner Cloud, DigitalOcean, OpenStack, Vultr, Oracle, Azure, GCP.
+#
+# Runs as root on the console via SystemRescue's autorun mechanism.
+# ---------------------------------------------------------------------------
+
+LOG=/var/log/rescue-cloudinit.log
+exec > >(tee -a "$LOG") 2>&1
+
+MDS="169.254.169.254"
+CURL="curl -fsS --connect-timeout 3 --max-time 6"
+KTMP="$(mktemp)"            # collected public keys
+NETJSON="$(mktemp)"         # OpenStack network_data.json (JSON), if any
+NETCFG="$(mktemp)"          # NoCloud network-config (netplan/v1/v2 YAML), if any
+NETPARSE="$(mktemp)"        # the network-config parser (written below)
+TOKHDR=()                   # IMDSv2 token header
+
+# authorized_keys line types we accept, comment stripped for clean dedup
+KEYRE='(sk-)?(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp[0-9]+)(@openssh\.com)? +[A-Za-z0-9+/=]+'
+
+log()  { echo "[cloudinit] $*"; }
+line() { echo "----------------------------------------------------------------"; }
+fetch() { local url="$1"; shift; $CURL "$@" "$url" 2>/dev/null; }
+collect() { grep -oE "$KEYRE" >> "$KTMP" 2>/dev/null || true; }
+
+echo "================================================================"
+echo " rescue-cloudinit  $(date -u +%FT%TZ)"
+echo "================================================================"
+
+# --------------------------------------------------------------------------
+# network-config parser: reads OpenStack network_data.json and cloud-init /
+# netplan network configs (v1 and v2), emits normalised lines:
+#     <dev> <static|dhcp> <cidr|-> <gateway|-> <dns,comma|->
+# --------------------------------------------------------------------------
+cat > "$NETPARSE" <<'PY'
+import json, os, sys
+
+def macmap():
+    m = {}
+    try: nics = os.listdir('/sys/class/net')
+    except OSError: nics = []
+    for n in nics:
+        try: m[open('/sys/class/net/%s/address' % n).read().strip().lower()] = n
+        except OSError: pass
+    return m
+MAC = macmap()
+def dev_for(mac, name):
+    mac = (mac or '').lower()
+    return MAC.get(mac, name)
+def plen(mask):
+    try: return sum(bin(int(o)).count('1') for o in mask.split('.'))
+    except Exception: return 24
+
+out = []
+def emit(dev, method, cidr='-', gw='-', dns='-'):
+    if dev: out.append((dev, method, cidr or '-', gw or '-', dns or '-'))
+
+def openstack(d):
+    ld = {l.get('id'): dev_for(l.get('ethernet_mac_address',''), l.get('id'))
+          for l in d.get('links', [])}
+    gdns = [s['address'] for s in d.get('services', []) if s.get('type') == 'dns']
+    for net in d.get('networks', []):
+        t = net.get('type',''); dev = ld.get(net.get('link'), net.get('link'))
+        if t.startswith('ipv4') and 'dhcp' in t: emit(dev,'dhcp'); continue
+        if t.startswith('ipv4') and net.get('ip_address'):
+            cidr = '%s/%d' % (net['ip_address'], plen(net.get('netmask','255.255.255.0')))
+            gw = ''
+            for r in net.get('routes', []):
+                if r.get('network') in ('0.0.0.0','::') or r.get('netmask') == '0.0.0.0':
+                    gw = r.get('gateway','')
+            dns = gdns + [s['address'] for s in net.get('services',[]) if s.get('type')=='dns']
+            emit(dev,'static',cidr,gw,','.join([x for x in dns if x]))
+
+def v1(cfg):
+    gdns = []
+    for e in cfg:
+        if e.get('type') == 'nameserver':
+            a = e.get('address', [])
+            gdns += a if isinstance(a, list) else [a]
+    for e in cfg:
+        if e.get('type') != 'physical': continue
+        dev = dev_for(e.get('mac_address',''), e.get('name',''))
+        for s in e.get('subnets', []):
+            st = s.get('type','')
+            if 'dhcp' in st: emit(dev,'dhcp'); continue
+            if st.startswith('static') and s.get('address'):
+                addr = str(s['address'])
+                if '/' not in addr and s.get('netmask'):
+                    addr = '%s/%d' % (addr, plen(str(s['netmask'])))
+                dn = s.get('dns_nameservers', [])
+                dn = [dn] if isinstance(dn, str) else list(dn)
+                emit(dev,'static',addr,s.get('gateway',''),','.join([x for x in gdns+dn if x]))
+
+def v2(eth):
+    for name, cfg in (eth or {}).items():
+        mac = (cfg.get('match') or {}).get('macaddress','')
+        dev = dev_for(mac, name)
+        if cfg.get('dhcp4'): emit(dev,'dhcp'); continue
+        gw = cfg.get('gateway4','') or ''
+        for r in cfg.get('routes', []) or []:
+            if r.get('to') in ('default','0.0.0.0/0'): gw = r.get('via', gw)
+        ns = ((cfg.get('nameservers') or {}).get('addresses')) or []
+        for a in cfg.get('addresses', []) or []:
+            if ':' in str(a): continue          # ipv4 apply only
+            emit(dev,'static',str(a),gw,','.join(ns)); break
+
+for path in sys.argv[1:]:
+    try: raw = open(path).read().strip()
+    except OSError: continue
+    if not raw: continue
+    data = None
+    try: data = json.loads(raw)
+    except Exception:
+        try:
+            import yaml; data = yaml.safe_load(raw)   # PyYAML ships with SystemRescue
+        except Exception: data = None
+    if not isinstance(data, dict): continue
+    nw = data.get('network') if isinstance(data.get('network'), dict) else data
+    if 'links' in data and 'networks' in data: openstack(data)
+    elif nw.get('version') == 1 or (nw.get('config') and not nw.get('ethernets')): v1(nw.get('config', []))
+    elif nw.get('version') == 2 or 'ethernets' in nw: v2(nw.get('ethernets', {}))
+
+seen = set()
+for row in out:
+    if row[0] in seen: continue
+    seen.add(row[0]); print(*row)
+PY
+
+# --------------------------------------------------------------------------
+# install the /root rescue toolkit from the boot medium
+# --------------------------------------------------------------------------
+tools=""
+for base in /run/archiso/bootmnt /run/archiso/copytoram /sysresccd /run/archiso/airootfs; do
+    [ -d "$base/root-tools" ] && { tools="$base/root-tools"; break; }
+done
+[ -z "$tools" ] && tools="$(find /run /mnt -maxdepth 5 -type d -name root-tools 2>/dev/null | head -1)"
+if [ -n "$tools" ] && [ -d "$tools" ]; then
+    cp "$tools"/*.sh /root/ 2>/dev/null
+    chmod 0755 /root/*.sh 2>/dev/null
+    log "installed rescue scripts in /root: $(cd "$tools" && echo *.sh)"
+else
+    log "WARN: root-tools not found on the boot medium"
+fi
+
+# --------------------------------------------------------------------------
+# 1) bring links up  (no long wait -- static IPs come from the config-drive)
+# --------------------------------------------------------------------------
+have_mds() { curl -s -o /dev/null --connect-timeout 2 --max-time 3 "http://$MDS/" 2>/dev/null; }
+have_v4()  { ip -4 -o addr show scope global 2>/dev/null | grep -q .; }
+have_net() { have_v4 || ip -6 route show default 2>/dev/null | grep -q .; }
+
+for d in /sys/class/net/*; do
+    dev="$(basename "$d")"; [ "$dev" = lo ] && continue
+    ip link set "$dev" up 2>/dev/null
+done
+sysctl -qw net.ipv6.conf.all.accept_ra=2 2>/dev/null
+
+apply_netcfg() {
+    command -v python3 >/dev/null 2>&1 && command -v nmcli >/dev/null 2>&1 || return
+    local _net; _net="$(python3 "$NETPARSE" "$NETCFG" "$NETJSON" 2>/dev/null)"
+    printf '%s\n' "$_net" | grep -q ' static ' || return
+    log "applying static network config from cloud-init data"
+    printf '%s\n' "$_net" | while read -r DEV METHOD CIDR GW DNS; do
+        [ "$METHOD" = static ] || continue
+        con="rescue-$DEV"
+        nmcli con delete "$con" >/dev/null 2>&1
+        nmcli con add type ethernet ifname "$DEV" con-name "$con" \
+              ipv4.method manual ipv4.addresses "$CIDR" >/dev/null 2>&1
+        [ "$GW"  != "-" ] && nmcli con mod "$con" ipv4.gateway "$GW"  >/dev/null 2>&1
+        [ "$DNS" != "-" ] && nmcli con mod "$con" ipv4.dns "$DNS"     >/dev/null 2>&1
+        nmcli con up "$con" >/dev/null 2>&1
+        log "net: $DEV -> $CIDR gw=$GW dns=$DNS"
+    done
+}
+
+# --------------------------------------------------------------------------
+# 2) config-drive first (needs no network) -> keys + netcfg, then apply the IP
+# --------------------------------------------------------------------------
+log "scanning for a cloud-init config-drive ..."
+for lbl in cidata CIDATA config-2 CONFIG-2; do
+    dev="$(blkid -L "$lbl" 2>/dev/null)" || continue
+    [ -n "$dev" ] || continue
+    mnt="$(mktemp -d)"
+    if mount -o ro "$dev" "$mnt" 2>/dev/null; then
+        log "found config-drive $lbl ($dev)"
+        grep -rhoE "$KEYRE" "$mnt" 2>/dev/null >> "$KTMP" || true
+        [ -s "$NETCFG" ]  || cp "$mnt/network-config" "$NETCFG" 2>/dev/null || true
+        [ -s "$NETJSON" ] || cp "$mnt/openstack/latest/network_data.json" "$NETJSON" 2>/dev/null || true
+        umount "$mnt" 2>/dev/null
+    fi
+    rmdir "$mnt" 2>/dev/null
+done
+apply_netcfg
+
+# --------------------------------------------------------------------------
+# 3) short wait for connectivity (DHCP, or the static IP we just applied)
+# --------------------------------------------------------------------------
+for i in $(seq 1 8); do have_net && break; sleep 1; done
+
+# --------------------------------------------------------------------------
+# 4) public-cloud metadata service (only if reachable; skipped on Proxmox)
+# --------------------------------------------------------------------------
+if have_mds; then
+    log "querying cloud metadata service ..."
+    _tok="$(fetch "http://$MDS/latest/api/token" -X PUT \
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')"
+    [ -n "$_tok" ] && TOKHDR=(-H "X-aws-ec2-metadata-token: $_tok")
+
+    _idx="$(fetch "http://$MDS/latest/meta-data/public-keys/" "${TOKHDR[@]}" \
+            | sed -n 's/^\([0-9][0-9]*\)=.*/\1/p')"
+    [ -z "$_idx" ] && _idx="0 1 2 3 4 5"
+    for i in $_idx; do
+        fetch "http://$MDS/latest/meta-data/public-keys/$i/openssh-key" "${TOKHDR[@]}" | collect
+    done
+
+    fetch "http://$MDS/hetzner/v1/metadata"             | collect   # Hetzner Cloud
+    fetch "http://$MDS/metadata/v1/public-keys"         | collect   # DigitalOcean
+    fetch "http://$MDS/metadata/v1.json"                | collect
+    fetch "http://$MDS/openstack/latest/meta_data.json" | collect   # OpenStack
+    [ -s "$NETJSON" ] || fetch "http://$MDS/openstack/latest/network_data.json" > "$NETJSON" 2>/dev/null
+    fetch "http://$MDS/v1.json"                         | collect   # Vultr
+    fetch "http://$MDS/opc/v2/instance/metadata/ssh_authorized_keys" \
+          -H 'Authorization: Bearer Oracle'            | collect   # Oracle OCI
+    fetch "http://$MDS/metadata/instance/compute/publicKeys?api-version=2021-02-01&format=json" \
+          -H 'Metadata:true'                           | collect   # Azure
+    fetch "http://metadata.google.internal/computeMetadata/v1/instance/attributes/ssh-keys" \
+          -H 'Metadata-Flavor: Google'                 | collect   # GCP
+    fetch "http://metadata.google.internal/computeMetadata/v1/project/attributes/ssh-keys" \
+          -H 'Metadata-Flavor: Google'                 | collect
+    apply_netcfg
+fi
+
+# --------------------------------------------------------------------------
+# 5) install collected keys (merge with any present, dedup by key blob)
+# --------------------------------------------------------------------------
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys
+{ cat /root/.ssh/authorized_keys 2>/dev/null; sort -u "$KTMP"; } \
+    | awk 'NF>=2 && !seen[$2]++' > /root/.ssh/authorized_keys.new
+mv /root/.ssh/authorized_keys.new /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+_nkeys="$(grep -c . /root/.ssh/authorized_keys 2>/dev/null)"   # prints 0 itself on no match
+_nkeys="${_nkeys:-0}"
+log "installed $_nkeys SSH key(s) into /root/.ssh/authorized_keys"
+
+# --------------------------------------------------------------------------
+# 6) open the firewall + make sure sshd is up with key-based root login
+# --------------------------------------------------------------------------
+# SystemRescue's default firewall DROPS inbound traffic (incl. SSH) -> that is
+# the classic "connection timed out". Disable it so we are reachable. (Also set
+# via global.nofirewall in the YAML; this is the belt-and-suspenders backup.)
+for svc in iptables ip6tables nftables firewalld; do
+    systemctl stop "$svc" >/dev/null 2>&1; systemctl disable "$svc" >/dev/null 2>&1
+done
+command -v iptables  >/dev/null 2>&1 && { iptables  -P INPUT ACCEPT 2>/dev/null; iptables  -F 2>/dev/null; }
+command -v ip6tables >/dev/null 2>&1 && { ip6tables -P INPUT ACCEPT 2>/dev/null; ip6tables -F 2>/dev/null; }
+command -v nft       >/dev/null 2>&1 && nft flush ruleset 2>/dev/null
+
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-rescue-cloudinit.conf <<'EOF'
+# installed by rescue-cloudinit -- key-based root login for the rescue system
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+EOF
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now sshd >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1
+fi
+
+# --------------------------------------------------------------------------
+# 7) summary -- on the console and in the SSH login banner
+# --------------------------------------------------------------------------
+SUM="$(mktemp)"
+{
+  line
+  echo " SystemRescue is ready for remote login"
+  line
+  echo " SSH keys installed : $_nkeys"
+  if [ "$_nkeys" -gt 0 ]; then
+      ssh-keygen -lf /root/.ssh/authorized_keys 2>/dev/null | sed 's/^/   - /'
+  else
+      echo "   (!) no keys found -- set the VM's Cloud-Init SSH key, or a static"
+      echo "       fallback key in /sysrescue.d/500-cloudinit.yaml, or rootpass="
+  fi
+  echo " IPv4 addresses:"
+  ip -4 -o addr show scope global 2>/dev/null | awk '{printf "   - %-8s %s\n",$2,$4}' | grep . || echo "   (none)"
+  echo " IPv6 addresses:"
+  ip -6 -o addr show scope global 2>/dev/null | awk '{printf "   - %-8s %s\n",$2,$4}' | grep . || echo "   (none)"
+  echo " sshd: $(systemctl is-active sshd 2>/dev/null || echo unknown)"
+  echo "   log in with:  ssh root@<ip-above>"
+  echo " VM rescue toolkit (in /root):"
+  echo "   ./rescue-menu.sh    interactive menu: health check, chroot, backup, repair, ..."
+  echo "   or run one directly, e.g.  ./vmcheck.sh   ./check-boot.sh   ./enter-chroot.sh"
+  line
+} > "$SUM"
+cat "$SUM"
+cp "$SUM" /etc/motd 2>/dev/null
+
+rm -f "$KTMP" "$NETJSON" "$NETCFG" "$NETPARSE" "$SUM"
+exit 0

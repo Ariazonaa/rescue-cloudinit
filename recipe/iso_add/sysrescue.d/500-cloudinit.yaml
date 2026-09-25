@@ -1,0 +1,30 @@
+---
+# rescue-cloudinit -- SystemRescue YAML config (applied after 100-defaults.yaml)
+#
+# The actual metadata pull (SSH keys + IPs) is done by /autorun/autorun.
+# This file only carries settings the native config system handles well and an
+# optional *static fallback* SSH key so you can always get in, even when the
+# metadata service is unreachable.
+
+global:
+    # keep the console root autologin (handy on the provider's web console)
+    noautologin: false
+    # don't copy the whole system to RAM by default (rescue disks are often big)
+    copytoram: false
+    # disable SystemRescue's default firewall so inbound SSH is reachable
+    # (default drops inbound -> "connection timed out"). autorun also flushes it.
+    nofirewall: true
+
+sysconfig:
+    # ----------------------------------------------------------------------
+    # Static fallback SSH key(s). UNCOMMENT and paste YOUR public key so you
+    # can log in even if the cloud metadata service has no key / is offline.
+    # Format:  "<comment>": "<keytype> <base64 blob>"
+    # (These are appended to /root/.ssh/authorized_keys; the autorun script
+    #  adds whatever it pulls from metadata on top.)
+    # ----------------------------------------------------------------------
+    # authorized_keys:
+    #     "you@laptop": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... paste-your-key"
+
+    # timezone for the rescue session (optional, e.g. "Europe/Berlin")
+    timezone: "UTC"

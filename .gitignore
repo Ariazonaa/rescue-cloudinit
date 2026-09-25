@@ -1,0 +1,2 @@
+# ISO images are large binaries -- keep them out of git
+*.iso

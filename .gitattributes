@@ -1,0 +1,4 @@
+# These run on Linux (SystemRescue) -- must stay LF regardless of host OS
+*.sh                        text eol=lf
+*.yaml                      text eol=lf
+recipe/iso_add/autorun/*    text eol=lf
