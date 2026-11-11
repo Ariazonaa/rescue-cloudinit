@@ -52,10 +52,11 @@ echo "================================================================"
 # --------------------------------------------------------------------------
 # network-config parser: reads OpenStack network_data.json and cloud-init /
 # netplan network configs (v1 and v2), emits normalised lines:
-#     <dev> <static|dhcp> <cidr|-> <gateway|-> <dns,comma|->
+#     <dev> <static|static6|dhcp> <cidr|-> <gateway|-> <dns,comma|->
+# static = IPv4, static6 = IPv6; gateway and DNS are of the same family.
 # --------------------------------------------------------------------------
 cat > "$NETPARSE" <<'PY'
-import json, os, sys
+import ipaddress, json, os, sys
 
 def macmap():
     m = {}
@@ -69,13 +70,24 @@ MAC = macmap()
 def dev_for(mac, name):
     mac = (mac or '').lower()
     return MAC.get(mac, name)
-def plen(mask):
-    try: return sum(bin(int(o)).count('1') for o in mask.split('.'))
-    except Exception: return 24
+def is6(a): return ':' in str(a)
+def plen(mask, v6):
+    mask = str(mask)
+    if mask.isdigit(): return int(mask)
+    try: return bin(int(ipaddress.ip_address(mask))).count('1')
+    except ValueError: return 64 if v6 else 24
+def cidr(addr, mask=None):
+    addr = str(addr)
+    if '/' in addr or not mask: return addr
+    return '%s/%d' % (addr, plen(mask, is6(addr)))
 
 out = []
-def emit(dev, method, cidr='-', gw='-', dns='-'):
-    if dev: out.append((dev, method, cidr or '-', gw or '-', dns or '-'))
+def emit(dev, method, cidr='-', gw='-', dns=()):
+    if not dev: return
+    dns = [x for x in dns if x and is6(x) == (method == 'static6')]
+    out.append((dev, method, cidr or '-', gw or '-', ','.join(dns) or '-'))
+def emit_static(dev, addr, gw, dns):
+    emit(dev, 'static6' if is6(addr) else 'static', addr, gw, dns)
 
 def openstack(d):
     ld = {l.get('id'): dev_for(l.get('ethernet_mac_address',''), l.get('id'))
@@ -83,15 +95,16 @@ def openstack(d):
     gdns = [s['address'] for s in d.get('services', []) if s.get('type') == 'dns']
     for net in d.get('networks', []):
         t = net.get('type',''); dev = ld.get(net.get('link'), net.get('link'))
-        if t.startswith('ipv4') and 'dhcp' in t: emit(dev,'dhcp'); continue
-        if t.startswith('ipv4') and net.get('ip_address'):
-            cidr = '%s/%d' % (net['ip_address'], plen(net.get('netmask','255.255.255.0')))
+        if 'dhcp' in t or 'slaac' in t: emit(dev,'dhcp'); continue
+        if t in ('ipv4', 'ipv6') and net.get('ip_address'):
+            v6 = t == 'ipv6'
+            addr = cidr(net['ip_address'], net.get('netmask') or ('64' if v6 else '255.255.255.0'))
             gw = ''
             for r in net.get('routes', []):
-                if r.get('network') in ('0.0.0.0','::') or r.get('netmask') == '0.0.0.0':
+                if r.get('network') in ('0.0.0.0','::') or r.get('netmask') in ('0.0.0.0','::'):
                     gw = r.get('gateway','')
             dns = gdns + [s['address'] for s in net.get('services',[]) if s.get('type')=='dns']
-            emit(dev,'static',cidr,gw,','.join([x for x in dns if x]))
+            emit_static(dev, addr, gw, dns)
 
 def v1(cfg):
     gdns = []
@@ -105,26 +118,28 @@ def v1(cfg):
         for s in e.get('subnets', []):
             st = s.get('type','')
             if 'dhcp' in st: emit(dev,'dhcp'); continue
-            if st.startswith('static') and s.get('address'):
-                addr = str(s['address'])
-                if '/' not in addr and s.get('netmask'):
-                    addr = '%s/%d' % (addr, plen(str(s['netmask'])))
+            if st.startswith('static') and s.get('address'):   # static, static6
+                addr = cidr(s['address'], s.get('netmask'))
                 dn = s.get('dns_nameservers', [])
                 dn = [dn] if isinstance(dn, str) else list(dn)
-                emit(dev,'static',addr,s.get('gateway',''),','.join([x for x in gdns+dn if x]))
+                emit_static(dev, addr, s.get('gateway',''), gdns + dn)
 
 def v2(eth):
     for name, cfg in (eth or {}).items():
         mac = (cfg.get('match') or {}).get('macaddress','')
         dev = dev_for(mac, name)
-        if cfg.get('dhcp4'): emit(dev,'dhcp'); continue
-        gw = cfg.get('gateway4','') or ''
+        if cfg.get('dhcp4') or cfg.get('dhcp6'): emit(dev,'dhcp')
+        gw = {False: cfg.get('gateway4') or '', True: cfg.get('gateway6') or ''}
         for r in cfg.get('routes', []) or []:
-            if r.get('to') in ('default','0.0.0.0/0'): gw = r.get('via', gw)
+            if r.get('to') in ('default','0.0.0.0/0','::/0') and r.get('via'):
+                gw[is6(r['via'])] = r['via']
         ns = ((cfg.get('nameservers') or {}).get('addresses')) or []
+        done = set()
         for a in cfg.get('addresses', []) or []:
-            if ':' in str(a): continue          # ipv4 apply only
-            emit(dev,'static',str(a),gw,','.join(ns)); break
+            v6 = is6(a)
+            if v6 in done or cfg.get('dhcp6' if v6 else 'dhcp4'): continue
+            done.add(v6)
+            emit_static(dev, str(a), gw[v6], ns)
 
 for path in sys.argv[1:]:
     try: raw = open(path).read().strip()
@@ -134,18 +149,22 @@ for path in sys.argv[1:]:
     try: data = json.loads(raw)
     except Exception:
         try:
-            import yaml; data = yaml.safe_load(raw)   # PyYAML ships with SystemRescue
-        except Exception: data = None
+            import yaml   # PyYAML ships with SystemRescue
+        except ImportError:
+            print('netparse: PyYAML missing, cannot read %s' % path, file=sys.stderr); continue
+        try: data = yaml.safe_load(raw)
+        except Exception as e:
+            print('netparse: %s: %s' % (path, e), file=sys.stderr); data = None
     if not isinstance(data, dict): continue
     nw = data.get('network') if isinstance(data.get('network'), dict) else data
     if 'links' in data and 'networks' in data: openstack(data)
     elif nw.get('version') == 1 or (nw.get('config') and not nw.get('ethernets')): v1(nw.get('config', []))
     elif nw.get('version') == 2 or 'ethernets' in nw: v2(nw.get('ethernets', {}))
 
-seen = set()
+seen = set()   # first source wins, per device and method
 for row in out:
-    if row[0] in seen: continue
-    seen.add(row[0]); print(*row)
+    if row[:2] in seen: continue
+    seen.add(row[:2]); print(*row)
 PY
 
 # --------------------------------------------------------------------------
@@ -177,22 +196,35 @@ for d in /sys/class/net/*; do
 done
 sysctl -qw net.ipv6.conf.all.accept_ra=2 2>/dev/null
 
+# run nmcli; on failure put its error into the log instead of dropping it
+nm_run() {
+    local err
+    err="$(nmcli "$@" 2>&1 >/dev/null)" && return 0
+    log "WARN: nmcli $*: ${err:-failed}"
+    return 1
+}
+
 apply_netcfg() {
     command -v python3 >/dev/null 2>&1 && command -v nmcli >/dev/null 2>&1 || return
-    local _net; _net="$(python3 "$NETPARSE" "$NETCFG" "$NETJSON" 2>/dev/null)"
-    printf '%s\n' "$_net" | grep -q ' static ' || return
+    local _net _devs="" DEV METHOD CIDR GW DNS fam con
+    _net="$(python3 "$NETPARSE" "$NETCFG" "$NETJSON")"
+    printf '%s\n' "$_net" | grep -qE '^[^ ]+ static6? ' || return
     log "applying static network config from cloud-init data"
-    printf '%s\n' "$_net" | while read -r DEV METHOD CIDR GW DNS; do
-        [ "$METHOD" = static ] || continue
+    # one NM connection per device; IPv4 and IPv6 entries are added to it
+    while read -r DEV METHOD CIDR GW DNS; do
+        case "$METHOD" in static) fam=ipv4 ;; static6) fam=ipv6 ;; *) continue ;; esac
         con="rescue-$DEV"
-        nmcli con delete "$con" >/dev/null 2>&1
-        nmcli con add type ethernet ifname "$DEV" con-name "$con" \
-              ipv4.method manual ipv4.addresses "$CIDR" >/dev/null 2>&1
-        [ "$GW"  != "-" ] && nmcli con mod "$con" ipv4.gateway "$GW"  >/dev/null 2>&1
-        [ "$DNS" != "-" ] && nmcli con mod "$con" ipv4.dns "$DNS"     >/dev/null 2>&1
-        nmcli con up "$con" >/dev/null 2>&1
-        log "net: $DEV -> $CIDR gw=$GW dns=$DNS"
-    done
+        if [[ " $_devs " != *" $DEV "* ]]; then
+            _devs="$_devs $DEV"
+            nmcli con delete "$con" >/dev/null 2>&1
+            nm_run con add type ethernet ifname "$DEV" con-name "$con" || continue
+        fi
+        nm_run con mod "$con" "$fam.method" manual "$fam.addresses" "$CIDR" || continue
+        [ "$GW"  != "-" ] && nm_run con mod "$con" "$fam.gateway" "$GW"
+        [ "$DNS" != "-" ] && nm_run con mod "$con" "$fam.dns" "$DNS"
+        log "net: $DEV $fam -> $CIDR gw=$GW dns=$DNS"
+    done <<<"$_net"
+    for DEV in $_devs; do nm_run con up "rescue-$DEV"; done
 }
 
 # --------------------------------------------------------------------------

@@ -21,8 +21,8 @@ service) and applies it.
 3. If a metadata service answers on 169.254.169.254, keys (and
    `network_data.json`) are fetched from there as well. On Proxmox this is
    skipped.
-4. A static IPv4 from the config is applied with `nmcli`. Netplan v1/v2 and
-   OpenStack JSON are understood.
+4. Static IPv4 and IPv6 addresses from the config (Proxmox `ip=` and `ip6=`)
+   are applied with `nmcli`. Netplan v1/v2 and OpenStack JSON are understood.
 5. sshd is started with key-only root login.
 6. IPs and key fingerprints are printed on the console and put into `/etc/motd`.
 

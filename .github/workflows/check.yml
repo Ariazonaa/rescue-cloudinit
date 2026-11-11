@@ -16,7 +16,10 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck -S warning build.sh build-on-linux.sh tools/embed-recipe.sh \
-            recipe/iso_add/autorun/autorun recipe/iso_add/root-tools/*.sh
+            tools/test-autorun.sh recipe/iso_add/autorun/autorun recipe/iso_add/root-tools/*.sh
+
+      - name: autorun network tests
+        run: bash tools/test-autorun.sh
 
       - name: embedded recipe is up to date
         run: bash tools/embed-recipe.sh --check
