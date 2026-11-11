@@ -80,9 +80,10 @@ chmod +x "$T/python3"
 run_apply() {   # json -> recorded nmcli calls
     printf '%s' "$1" > "$T/netcfg.json"; : > "$T/empty"; : > "$T/nm.log"
     (
+        # read by the sourced apply_netcfg / the nmcli stub
         PATH="$T:$PATH" NMLOG="$T/nm.log" NETPARSE="$T/netparse.py" \
         NETCFG="$T/netcfg.json" NETJSON="$T/empty"
-        export PATH NMLOG
+        export PATH NMLOG NETPARSE NETCFG NETJSON
         log() { :; }
         # shellcheck disable=SC1091
         . "$T/apply.sh"

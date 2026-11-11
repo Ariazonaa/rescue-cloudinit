@@ -198,9 +198,9 @@ sysctl -qw net.ipv6.conf.all.accept_ra=2 2>/dev/null
 
 # run nmcli; on failure put its error into the log instead of dropping it
 nm_run() {
-    local err
-    err="$(nmcli "$@" 2>&1 >/dev/null)" && return 0
-    log "WARN: nmcli $*: ${err:-failed}"
+    local out
+    out="$(nmcli "$@" 2>&1)" && return 0
+    log "WARN: nmcli $*: ${out:-failed}"
     return 1
 }
 
